@@ -32,7 +32,7 @@ KubeEdge 是一个由 [Cloud Native Computing Foundation](https://cncf.io) (CNCF
 
 ## 它如何工作
 
-KubeEdge 由云端和边缘端部分构成：
+KubeEdge-testing 由云端和边缘端部分构成：
 
 ### 架构
 
