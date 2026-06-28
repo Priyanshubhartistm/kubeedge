@@ -225,6 +225,67 @@ func processMessage(msg *beehiveModel.Message) {
 	}
 }
 
+// buildTLSConfig assembles a *tls.Config from an EdgeHub certificate/key pair
+// and an optional CA file. It returns (nil, nil) when certFile or keyFile is
+// empty, signalling that the server should run in plain-HTTP mode.
+//
+// Design rationale:
+//   - GetCertificate is used instead of a static Certificates slice so that
+//     certificate rotation (e.g. by CertManager) takes effect on the next
+//     TLS handshake without an EdgeCore restart.
+//   - ClientAuth defaults to tls.NoClientCert because local applications that
+//     talk to ServiceBus are not provisioned with EdgeCore client certs.
+//     The CA pool is still loaded (when available) so that operators can opt-in
+//     to mutual TLS in a follow-up.
+//   - A failed CA load is non-fatal: the server falls back to server-only TLS.
+func buildTLSConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
+	if certFile == "" || keyFile == "" {
+		return nil, nil
+	}
+
+	// Validate the key pair is loadable at startup so we fail fast with a
+	// clear error instead of crashing silently on the first TLS handshake.
+	if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
+		return nil, fmt.Errorf("[servicebus] failed to load TLS key pair: %w", err)
+	}
+
+	// Use GetCertificate so the cert is re-read from disk on every new TLS
+	// handshake, enabling transparent certificate rotation.
+	tlsCfg := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		// Local callers are not expected to present client certs.
+		// Set explicitly so the policy is visible and can be audited.
+		ClientAuth: tls.NoClientCert,
+		GetCertificate: func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			c, err := tls.LoadX509KeyPair(certFile, keyFile)
+			if err != nil {
+				return nil, fmt.Errorf("[servicebus] certificate rotation: failed to reload key pair: %w", err)
+			}
+			return &c, nil
+		},
+	}
+
+	if caFile != "" {
+		caCert, err := os.ReadFile(caFile)
+		if err != nil {
+			klog.Warningf("[servicebus] failed to read CA file %s, skipping client CA pool: %v", caFile, err)
+		} else {
+			caPool := x509.NewCertPool()
+			if ok := caPool.AppendCertsFromPEM(caCert); !ok {
+				// AppendCertsFromPEM returns false when no valid PEM certificate
+				// block was found. Skip it to avoid configuring an empty CA pool.
+				klog.Warningf("[servicebus] CA file %s contained no valid PEM certificates, skipping client CA pool", caFile)
+			} else {
+				// CA pool loaded. Keep ClientAuth at NoClientCert (server-only
+				// TLS) so that existing local applications continue to work.
+				tlsCfg.ClientCAs = caPool
+			}
+		}
+	}
+
+	return tlsCfg, nil
+}
+
 func server(stopChan <-chan struct{}) {
 	var (
 		timeout time.Duration
@@ -241,31 +302,18 @@ func server(stopChan <-chan struct{}) {
 		Handler: h,
 	}
 
-	// Reuse the EdgeCore certificate/key pair that CertManager already manages.
-	// Reading directly from the EdgeHub config avoids duplicating cert path config.
-	eh := options.GetEdgeCoreConfig().Modules.EdgeHub
-	certFile := eh.TLSCertFile
-	keyFile := eh.TLSPrivateKeyFile
-	if certFile != "" && keyFile != "" {
-		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	// Attempt to configure TLS by reusing the EdgeHub certificate/key pair that
+	// CertManager already manages. A configuration failure is not fatal:
+	// ServiceBus falls back to plain HTTP so EdgeCore continues operating.
+	if cfg := options.GetEdgeCoreConfig(); cfg != nil {
+		eh := cfg.Modules.EdgeHub
+		tlsCfg, err := buildTLSConfig(eh.TLSCertFile, eh.TLSPrivateKeyFile, eh.TLSCAFile)
 		if err != nil {
-			klog.Fatalf("[servicebus] failed to load TLS key pair: %v", err)
+			// Log the error but do not terminate EdgeCore.
+			klog.Errorf("[servicebus] TLS configuration failed (falling back to HTTP): %v", err)
+		} else {
+			s.TLSConfig = tlsCfg
 		}
-		tlsCfg := &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		}
-		if caFile := eh.TLSCAFile; caFile != "" {
-			caCert, err := os.ReadFile(caFile)
-			if err != nil {
-				klog.Warningf("[servicebus] failed to read CA file %s, skipping client CA: %v", caFile, err)
-			} else {
-				caPool := x509.NewCertPool()
-				caPool.AppendCertsFromPEM(caCert)
-				tlsCfg.ClientCAs = caPool
-			}
-		}
-		s.TLSConfig = tlsCfg
 	}
 
 	go func() {
@@ -280,7 +328,7 @@ func server(stopChan <-chan struct{}) {
 
 	if s.TLSConfig != nil {
 		klog.Infof("[servicebus] starting HTTPS server at %v", s.Addr)
-		// cert and key are already loaded into TLSConfig; pass empty strings.
+		// cert and key are already loaded via GetCertificate; pass empty strings.
 		utilruntime.HandleError(s.ListenAndServeTLS("", ""))
 	} else {
 		klog.Infof("[servicebus] starting HTTP server at %v (no TLS configured)", s.Addr)
