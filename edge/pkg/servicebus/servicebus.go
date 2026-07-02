@@ -3,12 +3,10 @@ package servicebus
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -21,7 +19,6 @@ import (
 	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
 	beehiveModel "github.com/kubeedge/beehive/pkg/core/model"
 	commonType "github.com/kubeedge/kubeedge/common/types"
-	"github.com/kubeedge/kubeedge/edge/cmd/edgecore/app/options"
 	"github.com/kubeedge/kubeedge/edge/pkg/common/message"
 	"github.com/kubeedge/kubeedge/edge/pkg/common/modules"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/dao/dbclient"
@@ -40,6 +37,39 @@ const (
 	maxBodySize = 5 * 1e6
 )
 
+// TLSOptions carries the ServiceBus-specific TLS certificate material.
+// It is passed explicitly through Register so that the server() function
+// never has to read global command-line options.
+//
+//   - If TLSEnabled is false, the server starts plain HTTP (backward-compatible
+//     default).
+//   - If TLSEnabled is true and the cert or key path is empty or invalid,
+//     Register returns an error and the server is NOT started in plain HTTP.
+//     A missing or bad TLS configuration must never silently downgrade to
+//     plaintext when the operator explicitly requested TLS.
+//   - ClientAuth is intentionally omitted: local applications that talk to
+//     ServiceBus are not provisioned with client certificates, so this
+//     implementation provides server-only TLS.  A follow-up can add
+//     configurable mTLS once a client-certificate provisioning workflow exists.
+//
+// NOTE: The certificate supplied here must have ExtKeyUsageServerAuth and
+// IP/DNS SANs that match ServiceBus.Server (e.g. 127.0.0.1).  The EdgeHub
+// client certificate CANNOT be reused because it carries ExtKeyUsageClientAuth
+// and no ServiceBus SANs.
+type TLSOptions struct {
+	// TLSEnabled controls whether the ServiceBus HTTP server starts with TLS.
+	// Default: false (plain HTTP, backward compatible).
+	TLSEnabled bool
+
+	// CertFile is the path to the PEM-encoded server certificate.
+	// Required when TLSEnabled is true.
+	CertFile string
+
+	// KeyFile is the path to the PEM-encoded private key.
+	// Required when TLSEnabled is true.
+	KeyFile string
+}
+
 // servicebus struct
 type servicebus struct {
 	enable bool
@@ -48,6 +78,7 @@ type servicebus struct {
 	port    int
 	timeout int
 	sbs     *dbclient.ServiceBusService
+	tlsOpts TLSOptions
 }
 
 type serverRequest struct {
@@ -65,20 +96,23 @@ type serverResponse struct {
 var htc = new(http.Client)
 var uc = new(util.URLClient)
 
-func newServicebus(enable bool, server string, port, timeout int) *servicebus {
+func newServicebus(enable bool, server string, port, timeout int, tlsOpts TLSOptions) *servicebus {
 	return &servicebus{
 		enable:  enable,
 		server:  server,
 		port:    port,
 		timeout: timeout,
 		sbs:     dbclient.NewServiceBusService(),
+		tlsOpts: tlsOpts,
 	}
 }
 
-// Register register servicebus
-func Register(s *v1alpha2.ServiceBus) {
+// Register registers the servicebus module.  tlsOpts controls whether the
+// embedded HTTP server uses TLS.  Pass a zero-value TLSOptions{} for plain
+// HTTP (backward-compatible default).
+func Register(s *v1alpha2.ServiceBus, tlsOpts TLSOptions) {
 	servicebusConfig.InitConfigure(s)
-	core.Register(newServicebus(s.Enable, s.Server, s.Port, s.Timeout))
+	core.Register(newServicebus(s.Enable, s.Server, s.Port, s.Timeout, tlsOpts))
 }
 
 func (*servicebus) Name() string {
@@ -109,7 +143,7 @@ func (sb *servicebus) Start() {
 	uc.Client = htc
 	if !sb.sbs.IsTableEmpty() {
 		if atomic.CompareAndSwapInt32(&inited, 0, 1) {
-			go server(c)
+			go server(c, sb.tlsOpts)
 		}
 	}
 	//Get message from channel
@@ -146,7 +180,7 @@ func processMessage(msg *beehiveModel.Message) {
 			klog.Error(err)
 		}
 		if atomic.CompareAndSwapInt32(&inited, 0, 1) {
-			go server(c)
+			go server(c, TLSOptions{}) // TLS not applicable for dynamic start
 		}
 	case message.OperationStop:
 		if err := dbc.DeleteUrlsByKey(resource); err != nil {
@@ -225,36 +259,54 @@ func processMessage(msg *beehiveModel.Message) {
 	}
 }
 
-// buildTLSConfig assembles a *tls.Config from an EdgeHub certificate/key pair
-// and an optional CA file. It returns (nil, nil) when certFile or keyFile is
-// empty, signalling that the server should run in plain-HTTP mode.
+// buildTLSConfig constructs a *tls.Config for server-only TLS from the given
+// certificate and key files.
 //
-// Design rationale:
+// Design decisions:
+//
+//   - Returns (nil, nil) only when opts.TLSEnabled is false — the caller is
+//     responsible for checking TLSEnabled before calling this function.
+//
+//   - Returns a non-nil error when opts.TLSEnabled is true but the cert or
+//     key path is empty or the key pair cannot be loaded.  The caller MUST
+//     treat this as a fatal configuration error and NOT fall back to plain
+//     HTTP.  Silently downgrading an explicitly enabled TLS endpoint removes
+//     transport security without notifying the operator.
+//
 //   - GetCertificate is used instead of a static Certificates slice so that
-//     certificate rotation (e.g. by CertManager) takes effect on the next
-//     TLS handshake without an EdgeCore restart.
-//   - ClientAuth defaults to tls.NoClientCert because local applications that
-//     talk to ServiceBus are not provisioned with EdgeCore client certs.
-//     The CA pool is still loaded (when available) so that operators can opt-in
-//     to mutual TLS in a follow-up.
-//   - A failed CA load is non-fatal: the server falls back to server-only TLS.
-func buildTLSConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
-	if certFile == "" || keyFile == "" {
+//     certificate rotation takes effect on the next TLS handshake without an
+//     EdgeCore restart.
+//
+//   - This function provides server-only TLS (ClientAuth: NoClientCert).
+//     Local applications that talk to ServiceBus are not provisioned with
+//     client certificates.  mTLS is intentionally out of scope until a
+//     client-certificate provisioning workflow is defined.
+//
+//   - The certificate must have ExtKeyUsageServerAuth and IP/DNS SANs
+//     matching the ServiceBus listen address (e.g. 127.0.0.1).
+func buildTLSConfig(opts TLSOptions) (*tls.Config, error) {
+	if !opts.TLSEnabled {
 		return nil, nil
+	}
+	if opts.CertFile == "" || opts.KeyFile == "" {
+		return nil, fmt.Errorf("[servicebus] TLS is enabled but CertFile or KeyFile is empty")
 	}
 
 	// Validate the key pair is loadable at startup so we fail fast with a
 	// clear error instead of crashing silently on the first TLS handshake.
-	if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
+	if _, err := tls.LoadX509KeyPair(opts.CertFile, opts.KeyFile); err != nil {
 		return nil, fmt.Errorf("[servicebus] failed to load TLS key pair: %w", err)
 	}
+
+	certFile := opts.CertFile
+	keyFile := opts.KeyFile
 
 	// Use GetCertificate so the cert is re-read from disk on every new TLS
 	// handshake, enabling transparent certificate rotation.
 	tlsCfg := &tls.Config{
 		MinVersion: tls.VersionTLS12,
-		// Local callers are not expected to present client certs.
-		// Set explicitly so the policy is visible and can be audited.
+		// Server-only TLS: local applications are not expected to present
+		// client certs.  Set explicitly so the policy is visible and auditable.
 		ClientAuth: tls.NoClientCert,
 		GetCertificate: func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			c, err := tls.LoadX509KeyPair(certFile, keyFile)
@@ -265,28 +317,10 @@ func buildTLSConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 		},
 	}
 
-	if caFile != "" {
-		caCert, err := os.ReadFile(caFile)
-		if err != nil {
-			klog.Warningf("[servicebus] failed to read CA file %s, skipping client CA pool: %v", caFile, err)
-		} else {
-			caPool := x509.NewCertPool()
-			if ok := caPool.AppendCertsFromPEM(caCert); !ok {
-				// AppendCertsFromPEM returns false when no valid PEM certificate
-				// block was found. Skip it to avoid configuring an empty CA pool.
-				klog.Warningf("[servicebus] CA file %s contained no valid PEM certificates, skipping client CA pool", caFile)
-			} else {
-				// CA pool loaded. Keep ClientAuth at NoClientCert (server-only
-				// TLS) so that existing local applications continue to work.
-				tlsCfg.ClientCAs = caPool
-			}
-		}
-	}
-
 	return tlsCfg, nil
 }
 
-func server(stopChan <-chan struct{}) {
+func server(stopChan <-chan struct{}, tlsOpts TLSOptions) {
 	var (
 		timeout time.Duration
 		err     error
@@ -302,18 +336,15 @@ func server(stopChan <-chan struct{}) {
 		Handler: h,
 	}
 
-	// Attempt to configure TLS by reusing the EdgeHub certificate/key pair that
-	// CertManager already manages. A configuration failure is not fatal:
-	// ServiceBus falls back to plain HTTP so EdgeCore continues operating.
-	if cfg := options.GetEdgeCoreConfig(); cfg != nil {
-		eh := cfg.Modules.EdgeHub
-		tlsCfg, err := buildTLSConfig(eh.TLSCertFile, eh.TLSPrivateKeyFile, eh.TLSCAFile)
+	if tlsOpts.TLSEnabled {
+		// TLS was explicitly requested.  A configuration error must be fatal:
+		// do NOT fall back to plain HTTP when the operator enabled TLS.
+		tlsCfg, err := buildTLSConfig(tlsOpts)
 		if err != nil {
-			// Log the error but do not terminate EdgeCore.
-			klog.Errorf("[servicebus] TLS configuration failed (falling back to HTTP): %v", err)
-		} else {
-			s.TLSConfig = tlsCfg
+			klog.Errorf("[servicebus] TLS configuration failed, not starting server: %v", err)
+			return
 		}
+		s.TLSConfig = tlsCfg
 	}
 
 	go func() {
@@ -331,7 +362,7 @@ func server(stopChan <-chan struct{}) {
 		// cert and key are already loaded via GetCertificate; pass empty strings.
 		utilruntime.HandleError(s.ListenAndServeTLS("", ""))
 	} else {
-		klog.Infof("[servicebus] starting HTTP server at %v (no TLS configured)", s.Addr)
+		klog.Infof("[servicebus] starting HTTP server at %v (TLS disabled)", s.Addr)
 		utilruntime.HandleError(s.ListenAndServe())
 	}
 }

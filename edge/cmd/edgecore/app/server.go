@@ -213,7 +213,11 @@ func registerModules(c *v1alpha2.EdgeCoreConfig) {
 	edgehub.Register(c.Modules.EdgeHub, c.Modules.Edged.HostnameOverride)
 	eventbus.Register(c.Modules.EventBus, c.Modules.Edged.HostnameOverride)
 	metamanager.Register(c.Modules.MetaManager)
-	servicebus.Register(c.Modules.ServiceBus)
+	// TLSOptions{} keeps TLSEnabled=false (backward-compatible plain HTTP default).
+	// To enable TLS, provide a dedicated ServiceBus server certificate with
+	// ExtKeyUsageServerAuth and an IP/DNS SAN matching ServiceBus.Server.
+	// The EdgeHub client certificate cannot be reused (see servicebus.TLSOptions).
+	servicebus.Register(c.Modules.ServiceBus, servicebus.TLSOptions{})
 	edgestream.Register(c.Modules.EdgeStream, c.Modules.Edged.HostnameOverride, c.Modules.Edged.NodeIP)
 	taskmanager.Register(c.Modules.TaskManager)
 	test.Register(c.Modules.DBTest)
