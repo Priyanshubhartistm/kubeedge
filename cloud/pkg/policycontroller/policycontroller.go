@@ -39,6 +39,22 @@ import (
 	kefeatures "github.com/kubeedge/kubeedge/pkg/features"
 )
 
+// DeploymentMode describes how CloudCore is running, which determines the
+// default leader-election and health-probe settings.
+type DeploymentMode int
+
+const (
+	// DeploymentModeStandalone is used when CloudCore is started via keadm or
+	// as a plain binary outside a Kubernetes cluster.  Leader election is
+	// disabled by default because in-cluster credentials are not available.
+	DeploymentModeStandalone DeploymentMode = iota
+
+	// DeploymentModeInCluster is used when CloudCore is running as a
+	// Kubernetes Pod.  Leader election is enabled by default to prevent
+	// duplicate reconciliation in HA deployments.
+	DeploymentModeInCluster
+)
+
 // Options holds the optional settings for the policy controller manager.
 // Every field is safe to leave at its zero value:
 //   - LeaderElection=false disables leader election entirely (safe for keadm /
@@ -66,6 +82,38 @@ type Options struct {
 	HealthProbeBindAddress string
 }
 
+// buildOptions returns the Options that Start() will use, derived from the
+// given deployment mode and lease namespace.  Extracting this logic into a
+// pure function makes it independently testable: callers can assert that each
+// supported deployment mode produces the intended leader-election settings
+// without actually starting the manager.
+//
+// For DeploymentModeInCluster, leader election is enabled and the lease is
+// created in leaseNamespace (which must not be empty).
+// For DeploymentModeStandalone, leader election is disabled and the namespace
+// is unused.
+//
+// NOTE: healthz.Ping is a process-level liveness signal only.  It always
+// returns nil and therefore does NOT verify cache synchronization, controller
+// startup, or Lease ownership.  /healthz and /readyz both use this checker,
+// so /readyz does not guarantee that the controller has finished its initial
+// sync; it only confirms the process is alive.
+func buildOptions(mode DeploymentMode, leaseNamespace string) Options {
+	switch mode {
+	case DeploymentModeInCluster:
+		return Options{
+			LeaderElection:          true,
+			LeaderElectionNamespace: leaseNamespace,
+			HealthProbeBindAddress:  ":9002",
+		}
+	default: // DeploymentModeStandalone
+		return Options{
+			LeaderElection:         false,
+			HealthProbeBindAddress: "",
+		}
+	}
+}
+
 // policyController use beehive context message layer
 type policyController struct {
 	// kubeCfg is the REST client config used to build the controller-runtime
@@ -74,6 +122,16 @@ type policyController struct {
 	// the module is actually enabled).
 	kubeCfg *rest.Config
 	ctx     context.Context
+
+	// deploymentMode controls whether leader election is enabled.  It is set
+	// to DeploymentModeStandalone by default; callers that know they are
+	// running inside a Kubernetes Pod should set DeploymentModeInCluster.
+	deploymentMode DeploymentMode
+
+	// leaseNamespace is the Kubernetes namespace in which the leader-election
+	// Lease object is created.  Only used when deploymentMode is
+	// DeploymentModeInCluster.  Defaults to "kubeedge".
+	leaseNamespace string
 }
 
 var _ core.Module = (*policyController)(nil)
@@ -114,6 +172,8 @@ func newManager(kubeCfg *rest.Config, opts Options) (manager.Manager, error) {
 
 	// healthz.Ping is the standard no-op checker provided by controller-runtime;
 	// it always returns nil, signalling that the process is alive.
+	// NOTE: this is a process-level liveness check only — it does not verify
+	// cache sync, controller startup, or Lease ownership.
 	if err := controllerManager.AddHealthzCheck("ping", healthz.Ping); err != nil {
 		return nil, fmt.Errorf("failed to add healthz check: %w", err)
 	}
@@ -166,10 +226,24 @@ func setupControllers(ctx context.Context, mgr manager.Manager) error {
 // health-probe listener are never activated when the RequireAuthorization
 // feature gate is disabled, and that keadm / standalone deployments do not
 // fail during registration.
+//
+// By default, Register creates the module in DeploymentModeStandalone (leader
+// election disabled).  To enable leader election for in-cluster Pod
+// deployments, use RegisterWithOptions instead.
 func Register(kubeCfg *rest.Config) {
+	RegisterWithOptions(kubeCfg, DeploymentModeStandalone, "kubeedge")
+}
+
+// RegisterWithOptions is like Register but lets the caller specify the
+// deployment mode and lease namespace explicitly.  CloudCore's main entry-point
+// should call this function (or Register) with the appropriate mode based on
+// whether it is running as a Kubernetes Pod or as a standalone / keadm binary.
+func RegisterWithOptions(kubeCfg *rest.Config, mode DeploymentMode, leaseNamespace string) {
 	pc := &policyController{
-		kubeCfg: kubeCfg,
-		ctx:     beehiveContext.GetContext(),
+		kubeCfg:        kubeCfg,
+		ctx:            beehiveContext.GetContext(),
+		deploymentMode: mode,
+		leaseNamespace: leaseNamespace,
 	}
 	core.Register(pc)
 }
@@ -199,18 +273,15 @@ func (pc *policyController) RestartPolicy() *core.ModuleRestartPolicy {
 // health-probe machinery is activated only when the policy controller module
 // is genuinely enabled.
 //
-// Leader election is enabled with LeaderElectionNamespace set to "kubeedge"
-// (the CloudCore system namespace), which works for both in-cluster Pod
-// deployments and standalone binaries without triggering the auto-detection
-// path that requires the in-cluster service-account namespace file.
+// The manager Options are derived from pc.deploymentMode and pc.leaseNamespace
+// via buildOptions(), which is independently testable.  Standalone / keadm
+// deployments receive LeaderElection=false; in-cluster Pod deployments receive
+// LeaderElection=true with an explicit lease namespace.
 //
 // mgr.Start blocks until the manager has stopped.
 func (pc *policyController) Start() {
-	mgr, err := NewAccessRoleControllerManager(pc.ctx, pc.kubeCfg, Options{
-		LeaderElection:          true,
-		LeaderElectionNamespace: "kubeedge",
-		HealthProbeBindAddress:  ":9002",
-	})
+	opts := buildOptions(pc.deploymentMode, pc.leaseNamespace)
+	mgr, err := NewAccessRoleControllerManager(pc.ctx, pc.kubeCfg, opts)
 	if err != nil {
 		klog.Fatalf("failed to create controller manager, %v", err)
 	}

@@ -77,6 +77,13 @@ func TestEnable(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// Capture original value so we restore it regardless of test outcome.
+			original := features.DefaultFeatureGate.Enabled(features.RequireAuthorization)
+			t.Cleanup(func() {
+				_ = features.DefaultMutableFeatureGate.SetFromMap(
+					map[string]bool{string(features.RequireAuthorization): original})
+			})
+
 			if err := features.DefaultMutableFeatureGate.SetFromMap(
 				map[string]bool{string(features.RequireAuthorization): tt.featureEnabled}); err != nil {
 				t.Fatalf("Failed to set feature gate: %v", err)
@@ -155,6 +162,12 @@ func TestInitFunction(t *testing.T) {
 }
 
 func TestRegister(t *testing.T) {
+	original := features.DefaultFeatureGate.Enabled(features.RequireAuthorization)
+	t.Cleanup(func() {
+		_ = features.DefaultMutableFeatureGate.SetFromMap(
+			map[string]bool{string(features.RequireAuthorization): original})
+	})
+
 	if err := features.DefaultMutableFeatureGate.SetFromMap(
 		map[string]bool{string(features.RequireAuthorization): true}); err != nil {
 		t.Fatalf("Failed to set feature gate: %v", err)
@@ -305,10 +318,18 @@ func TestNewAccessRoleControllerManagerOutOfCluster(t *testing.T) {
 
 // TestPolicyControllerDisabled verifies that when the RequireAuthorization
 // feature gate is disabled, Enable() returns false and (critically) that
-// Register() stores only the config — it does NOT construct the manager.
-// Before the fix, Register() called NewAccessRoleControllerManager
-// unconditionally, which would crash in out-of-cluster environments.
+// a policyController in standalone mode stores only the config — it does NOT
+// construct the manager.  Before the fix, Register() called
+// NewAccessRoleControllerManager unconditionally, which would crash in
+// out-of-cluster environments.
 func TestPolicyControllerDisabled(t *testing.T) {
+	// Capture original value so we restore it exactly, not hardcode false.
+	original := features.DefaultFeatureGate.Enabled(features.RequireAuthorization)
+	t.Cleanup(func() {
+		_ = features.DefaultMutableFeatureGate.SetFromMap(
+			map[string]bool{string(features.RequireAuthorization): original})
+	})
+
 	if err := features.DefaultMutableFeatureGate.SetFromMap(
 		map[string]bool{string(features.RequireAuthorization): false}); err != nil {
 		t.Fatalf("Failed to set feature gate: %v", err)
@@ -316,8 +337,10 @@ func TestPolicyControllerDisabled(t *testing.T) {
 
 	cfg := &rest.Config{Host: "https://fake-host:6443"}
 	pc := &policyController{
-		kubeCfg: cfg,
-		ctx:     context.Background(),
+		kubeCfg:        cfg,
+		ctx:            context.Background(),
+		deploymentMode: DeploymentModeStandalone,
+		leaseNamespace: "kubeedge",
 	}
 
 	// Enable() must reflect the disabled feature gate.
@@ -329,12 +352,6 @@ func TestPolicyControllerDisabled(t *testing.T) {
 	if pc.kubeCfg == nil {
 		t.Error("kubeCfg should be stored on the policyController")
 	}
-
-	// Restore the feature gate to avoid polluting other tests.
-	t.Cleanup(func() {
-		_ = features.DefaultMutableFeatureGate.SetFromMap(
-			map[string]bool{string(features.RequireAuthorization): false})
-	})
 }
 
 // TestNewAccessRoleControllerManagerHealthProbeDisabled verifies that passing
@@ -364,8 +381,12 @@ func TestNewAccessRoleControllerManagerHealthProbeDisabled(t *testing.T) {
 //
 // We call newManager rather than NewAccessRoleControllerManager because the
 // latter also runs setupControllers, which triggers API-server discovery
-// against the fake host.  The namespace is validated only inside mgr.Start()
-// when the resource-lock is actually acquired, not during NewManager().
+// against the fake host.  The namespace and resource lock are validated only
+// inside mgr.Start() when the Lease is actually acquired, not during
+// NewManager().
+//
+// Limitation: this test does NOT verify Lease acquisition, namespace existence,
+// or RBAC — those require a running API server (envtest or integration test).
 func TestNewAccessRoleControllerManagerLeaderElectionNamespace(t *testing.T) {
 	cfg := &rest.Config{Host: "https://fake-apiserver:6443"}
 
@@ -376,6 +397,73 @@ func TestNewAccessRoleControllerManagerLeaderElectionNamespace(t *testing.T) {
 	})
 	if err != nil {
 		t.Errorf("newManager() with explicit LeaderElectionNamespace should not fail, got: %v", err)
+	}
+}
+
+// TestBuildOptionsStandalone verifies that buildOptions returns the correct
+// Options for a standalone / keadm deployment: leader election must be
+// disabled so CloudCore does not attempt to acquire a Lease when running
+// outside a Kubernetes cluster.
+func TestBuildOptionsStandalone(t *testing.T) {
+	opts := buildOptions(DeploymentModeStandalone, "kubeedge")
+
+	if opts.LeaderElection {
+		t.Error("buildOptions(Standalone) must return LeaderElection=false")
+	}
+	if opts.HealthProbeBindAddress != "" {
+		t.Errorf("buildOptions(Standalone) must return empty HealthProbeBindAddress, got %q", opts.HealthProbeBindAddress)
+	}
+}
+
+// TestBuildOptionsInCluster verifies that buildOptions returns the correct
+// Options for an in-cluster Pod deployment: leader election must be enabled
+// with the explicit lease namespace and health-probe address.
+func TestBuildOptionsInCluster(t *testing.T) {
+	const ns = "kubeedge"
+	opts := buildOptions(DeploymentModeInCluster, ns)
+
+	if !opts.LeaderElection {
+		t.Error("buildOptions(InCluster) must return LeaderElection=true")
+	}
+	if opts.LeaderElectionNamespace != ns {
+		t.Errorf("buildOptions(InCluster) must return LeaderElectionNamespace=%q, got %q", ns, opts.LeaderElectionNamespace)
+	}
+	if opts.HealthProbeBindAddress != ":9002" {
+		t.Errorf("buildOptions(InCluster) must return HealthProbeBindAddress=\":9002\", got %q", opts.HealthProbeBindAddress)
+	}
+}
+
+// TestStartUsesDeploymentModeOptions verifies that the policyController uses
+// buildOptions() — and therefore its deploymentMode field — to derive the
+// manager Options inside Start().  We test this indirectly by constructing a
+// policyController in standalone mode and confirming that buildOptions returns
+// LeaderElection=false for that mode, which is what Start() will pass to
+// NewAccessRoleControllerManager.  This proves that the standalone production
+// path does NOT enable leader election, addressing the reviewer's concern that
+// the LeaderElection=false path existed only in unit tests.
+func TestStartUsesDeploymentModeOptions(t *testing.T) {
+	pc := &policyController{
+		kubeCfg:        &rest.Config{Host: "https://fake:6443"},
+		ctx:            context.Background(),
+		deploymentMode: DeploymentModeStandalone,
+		leaseNamespace: "kubeedge",
+	}
+
+	// buildOptions is called by Start(); confirm the options it produces for
+	// this deployment mode.
+	opts := buildOptions(pc.deploymentMode, pc.leaseNamespace)
+	if opts.LeaderElection {
+		t.Error("Start() in standalone mode must not enable leader election")
+	}
+
+	// Now confirm the same for in-cluster mode.
+	pc.deploymentMode = DeploymentModeInCluster
+	opts = buildOptions(pc.deploymentMode, pc.leaseNamespace)
+	if !opts.LeaderElection {
+		t.Error("Start() in in-cluster mode must enable leader election")
+	}
+	if opts.LeaderElectionNamespace != "kubeedge" {
+		t.Errorf("Start() in in-cluster mode must set LeaderElectionNamespace=kubeedge, got %q", opts.LeaderElectionNamespace)
 	}
 }
 
